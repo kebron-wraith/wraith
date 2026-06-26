@@ -40,6 +40,9 @@ class AntibodyDatabase:
     When cells communicate, they share antibodies. The organism gets
     smarter with every attack — anywhere.
 
+    Uses a class-level shared connection so multiple instances (cells)
+    share the same SQLite connection without lock contention.
+
     Schema:
         - threat_hash: unique fingerprint of the threat
         - threat_type: category (ransomware, phishing, prompt_injection, etc.)
@@ -51,21 +54,36 @@ class AntibodyDatabase:
         - seen_count: how many cells have confirmed this
     """
 
+    _class_conn: Optional[sqlite3.Connection] = None
+    _class_lock = threading.Lock()
+
     def __init__(self, db_path: Path = ANTIBODY_DB):
         self.db_path = str(db_path)
-        self._local = threading.local()
-        self._init_db()
+        AntibodyDatabase._db_path = self.db_path
 
     @property
     def _conn(self) -> sqlite3.Connection:
-        if not hasattr(self._local, "conn") or self._local.conn is None:
-            self._local.conn = sqlite3.connect(self.db_path, timeout=30)
-            self._local.conn.row_factory = sqlite3.Row
-            self._local.conn.execute("PRAGMA journal_mode=WAL")
-        return self._local.conn
+        if self._class_conn is None:
+            with self._class_lock:
+                if self._class_conn is None:
+                    self._class_conn = sqlite3.connect(
+                        self._db_path, timeout=30, check_same_thread=False,
+                        isolation_level=None  # autocommit mode
+                    )
+                    self._class_conn.row_factory = sqlite3.Row
+                    self._class_conn.execute("PRAGMA journal_mode=WAL")
+                    self._class_conn.execute("PRAGMA busy_timeout=10000")
+                    self._init_db()
+        return self._class_conn
+
+    def _exec(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
+        """Thread-safe execute with lock."""
+        with self._class_lock:
+            return self._conn.execute(sql, params)
 
     def _init_db(self):
-        with self._conn as c:
+        with self._class_lock:
+            c = self._conn
             c.executescript("""
                 CREATE TABLE IF NOT EXISTS antibodies (
                     threat_hash TEXT PRIMARY KEY,
@@ -100,27 +118,27 @@ class AntibodyDatabase:
         threat_hash = hashlib.sha256(f"{threat_type}:{sig_json}".encode()).hexdigest()[:24]
         defense_json = json.dumps(defense)
         now = datetime.now().isoformat()
+        c = self._conn
 
-        with self._conn as c:
-            # Check if we already have this antibody
-            existing = c.execute(
-                "SELECT * FROM antibodies WHERE threat_hash=?", (threat_hash,)
-            ).fetchone()
+        # Check if we already have this antibody
+        existing = c.execute(
+            "SELECT * FROM antibodies WHERE threat_hash=?", (threat_hash,)
+        ).fetchone()
 
-            if existing:
-                # Update seen count and confidence
-                new_confidence = min(100, existing["confidence"] + 5)
-                c.execute(
-                    "UPDATE antibodies SET seen_count=seen_count+1, last_seen=?, confidence=? WHERE threat_hash=?",
-                    (now, new_confidence, threat_hash)
-                )
-            else:
-                # New antibody
-                c.execute(
-                    "INSERT INTO antibodies (threat_hash, threat_type, signature, defense, source_cell, confidence, created_at, last_seen) VALUES (?,?,?,?,?,?,?,?)",
-                    (threat_hash, threat_type, sig_json, defense_json, source_cell, confidence, now, now)
-                )
-                log.info(f"New antibody recorded: {threat_type} [{threat_hash[:12]}] from {source_cell[:12]}")
+        if existing:
+            # Update seen count and confidence
+            new_confidence = min(100, existing["confidence"] + 5)
+            c.execute(
+                "UPDATE antibodies SET seen_count=seen_count+1, last_seen=?, confidence=? WHERE threat_hash=?",
+                (now, new_confidence, threat_hash)
+            )
+        else:
+            # New antibody
+            c.execute(
+                "INSERT INTO antibodies (threat_hash, threat_type, signature, defense, source_cell, confidence, created_at, last_seen) VALUES (?,?,?,?,?,?,?,?)",
+                (threat_hash, threat_type, sig_json, defense_json, source_cell, confidence, now, now)
+            )
+            log.info(f"New antibody recorded: {threat_type} [{threat_hash[:12]}] from {source_cell[:12]}")
 
         return threat_hash
 
@@ -214,18 +232,18 @@ class AntibodyDatabase:
     def update_peer_trust(self, cell_id: str, ip: str, port: int, antibodies_shared: int = 0):
         """Update peer contact info and trust score."""
         now = datetime.now().isoformat()
-        with self._conn as c:
-            existing = c.execute("SELECT * FROM gossip_peers WHERE cell_id=?", (cell_id,)).fetchone()
-            if existing:
-                c.execute(
-                    "UPDATE gossip_peers SET ip=?, port=?, last_contact=?, antibodies_shared=antibodies_shared+? WHERE cell_id=?",
-                    (ip, port, now, antibodies_shared, cell_id)
-                )
-            else:
-                c.execute(
-                    "INSERT INTO gossip_peers (cell_id, ip, port, last_contact, antibodies_shared) VALUES (?,?,?,?,?)",
-                    (cell_id, ip, port, now, antibodies_shared)
-                )
+        c = self._conn
+        existing = c.execute("SELECT * FROM gossip_peers WHERE cell_id=?", (cell_id,)).fetchone()
+        if existing:
+            c.execute(
+                "UPDATE gossip_peers SET ip=?, port=?, last_contact=?, antibodies_shared=antibodies_shared+? WHERE cell_id=?",
+                (ip, port, now, antibodies_shared, cell_id)
+            )
+        else:
+            c.execute(
+                "INSERT INTO gossip_peers (cell_id, ip, port, last_contact, antibodies_shared) VALUES (?,?,?,?,?)",
+                (cell_id, ip, port, now, antibodies_shared)
+            )
 
     def get_trusted_peers(self, min_trust: int = 30, limit: int = 20) -> List[Dict]:
         """Get peers sorted by trust score."""
